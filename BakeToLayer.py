@@ -263,6 +263,19 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
         default='DOT'
     )
 
+    # Wireframe Props
+    wireframe_size : FloatProperty(
+        name = 'Wireframe Size',
+        description = 'Wireframe thickness in Blender units',
+        default=0.001, min=0.0, max=100.0, precision=4
+    )
+
+    wireframe_triangulated : BoolProperty(
+        name = 'Triangulated',
+        description = 'Use the triangulated wireframe rather than the actual polygons',
+        default = False
+    )
+
     multires_base : IntProperty(
         name = 'Multires Base',
         description = 'Baking will use the difference between the base level and max level,\nand after baking, base level will be used in the multires modifier',
@@ -452,6 +465,9 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
             self.blend_type = 'MIX'
             self.samples = 32
             self.only_local = True
+        elif self.type == 'WIREFRAME':
+            self.blend_type = 'MIX'
+            self.ssaa = True
         elif self.type == 'BEVEL_NORMAL':
             self.blend_type = 'MIX'
             self.normal_blend_type = 'OVERLAY'
@@ -682,7 +698,7 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
 
         row = split_layout(self.layout, 0.4)
 
-        show_subsurf_influence = not self.type.startswith('MULTIRES_') and self.type not in {'SELECTED_VERTICES'}
+        show_subsurf_influence = not self.type.startswith('MULTIRES_') and (self.type not in {'SELECTED_VERTICES', 'WIREFRAME'} or (self.type == 'WIREFRAME' and is_bl_newer_than(2, 81) and not self.wireframe_triangulated))
         show_use_baked_disp = height_root_ch and not self.type.startswith('MULTIRES_') and self.type not in {'SELECTED_VERTICES'}
 
         col = row.column(align=False)
@@ -726,6 +742,10 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
         elif self.type == 'THICKNESS':
             col.label(text='Distance:')
             col.label(text='')
+        elif self.type == 'WIREFRAME':
+            col.label(text='Wireframe Size:')
+            if is_bl_newer_than(2, 81):
+                col.label(text='')
         elif self.type in {'BEVEL_NORMAL', 'BEVEL_MASK'}:
             col.label(text='Bevel Samples:')
             col.label(text='Bevel Radius:')
@@ -819,6 +839,10 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
         elif self.type == 'THICKNESS':
             col.prop(self, 'ao_distance', text='')
             col.prop(self, 'only_local')
+        elif self.type == 'WIREFRAME':
+            col.prop(self, 'wireframe_size', text='')
+            if is_bl_newer_than(2, 81):
+                col.prop(self, 'wireframe_triangulated')
         elif self.type in {'BEVEL_NORMAL', 'BEVEL_MASK'}:
             col.prop(self, 'bevel_samples', text='')
             col.prop(self, 'bevel_radius', text='')
@@ -861,6 +885,9 @@ class YBakeToLayer(bpy.types.Operator, BaseBakeOperator):
         if self.type.startswith('OTHER_OBJECT_'):
             col.prop(self, 'ssaa')
         else: col.prop(self, 'fxaa')
+
+        if self.type == 'WIREFRAME':
+            col.prop(self, 'ssaa')
 
         if self.type in {'AO', 'THICKNESS', 'BEVEL_MASK', 'BEVEL_NORMAL'} and is_bl_newer_than(2, 81):
             col.prop(self, 'denoise')

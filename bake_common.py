@@ -8,6 +8,8 @@ from . import lib, Layer, ImageAtlas, UDIM, image_ops, Mask, vector_displacement
 BL28_HACK = True
 
 TEMP_VCOL = '__temp__vcol__'
+TEMP_WIRE_UV = '__temp__wire_uv__'
+TEMP_WIRE_SCALE_UV = '__temp__wire_scale_uv__'
 TEMP_EMISSION = '_TEMP_EMI_'
 
 BAKE_PROBLEMATIC_MODIFIERS = {
@@ -2082,6 +2084,8 @@ def get_bake_properties_from_self(self):
         'bevel_samples',
         'bevel_radius',
         'edge_detect_method',
+        'wireframe_size',
+        'wireframe_triangulated',
         'multires_base',
         'target_type',
         'fxaa',
@@ -2855,6 +2859,50 @@ def get_bakeable_objects_and_meshes(mat, cage_object=None):
 
     return objs, meshes
 
+def fill_wireframe_uvs(obj, temp_uv, scale_uv):
+    # Map every face to the unit square for the border distance shader:
+    # quads take the four corners, triangles three of them with a negated
+    # height so the shader also draws their diagonal third edge, and ngons
+    # sit at the center where nothing draws, leaving their edges to their
+    # neighboring faces
+    me = obj.data
+    npf, nl, nv = len(me.polygons), len(me.loops), len(me.vertices)
+    if npf == 0 or nl == 0: return
+
+    lt = numpy.empty(npf, dtype=numpy.int64); me.polygons.foreach_get('loop_total', lt)
+    ls = numpy.empty(npf, dtype=numpy.int64); me.polygons.foreach_get('loop_start', ls)
+    lv = numpy.empty(nl, dtype=numpy.int64); me.loops.foreach_get('vertex_index', lv)
+    co = numpy.empty(nv * 3, dtype=numpy.float32); me.vertices.foreach_get('co', co); co.shape = (-1, 3)
+    mw = numpy.array(obj.matrix_world, dtype=numpy.float32)
+    cow = co @ mw[:3, :3].T + mw[:3, 3]
+
+    # Face world extents, the first edge spans u and the closing edge v
+    v0 = cow[lv[ls]]
+    width = numpy.linalg.norm(cow[lv[ls + 1]] - v0, axis=1)
+    height = numpy.linalg.norm(cow[lv[ls + lt - 1]] - v0, axis=1)
+    height = numpy.where(lt == 3, -height, height)
+
+    jf = numpy.arange(nl) - numpy.repeat(ls, lt)
+    n = numpy.repeat(lt, lt)
+    corner = numpy.minimum(jf, 3)
+    u = numpy.where((corner == 1) | (corner == 2), 1.0, 0.0)
+    v = numpy.where(corner >= 2, 1.0, 0.0)
+    tri = n == 3
+    u = numpy.where(tri, (jf >= 1).astype(numpy.float64), u)
+    v = numpy.where(tri, (jf == 2).astype(numpy.float64), v)
+    ngon = n > 4
+    u = numpy.where(ngon, 0.5, u)
+    v = numpy.where(ngon, 0.5, v)
+
+    uvs = numpy.empty((nl, 2), dtype=numpy.float32)
+    uvs[:, 0] = u
+    uvs[:, 1] = v
+    temp_uv.data.foreach_set('uv', uvs.ravel())
+    scales = numpy.empty((nl, 2), dtype=numpy.float32)
+    scales[:, 0] = numpy.repeat(width, lt)
+    scales[:, 1] = numpy.repeat(height, lt)
+    scale_uv.data.foreach_set('uv', scales.ravel())
+
 def bake_to_entity(bprops, overwrite_img=None, segment=None):
 
     T = time.time()
@@ -2999,8 +3047,8 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
     # FXAA also does not works well with baked image with alpha, so other object bake will use SSAA instead
     use_fxaa = not bprops.hdr and bprops.fxaa and not bprops.type.startswith('OTHER_OBJECT_')
 
-    # For now SSAA only works with other object baking
-    use_ssaa = bprops.ssaa and bprops.type.startswith('OTHER_OBJECT_')
+    # For now SSAA only works with other object and wireframe baking
+    use_ssaa = bprops.ssaa and (bprops.type.startswith('OTHER_OBJECT_') or bprops.type == 'WIREFRAME')
 
     # Denoising only available for AO bake for now
     use_denoise = bprops.denoise and bprops.type in {'AO', 'THICKNESS', 'BEVEL_MASK', 'BEVEL_NORMAL'} and is_bl_newer_than(2, 81)
@@ -3059,6 +3107,12 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
         else:
             temp_objs.extend(get_duplicated_mesh_objects(scene, objs, True))
             objs = temp_objs
+
+    # Wireframe polygon mode also needs duplicated objects when applying subsurf
+    elif (bprops.type == 'WIREFRAME' and not bprops.wireframe_triangulated and is_bl_newer_than(2, 81)
+          and (bprops.subsurf_influence or bprops.use_baked_disp)):
+        temp_objs.extend(get_duplicated_mesh_objects(scene, objs, True))
+        objs = temp_objs
 
     # Join objects then extend with other objects
     elif bprops.type.startswith('OTHER_OBJECT_'):
@@ -3123,6 +3177,43 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
         bpy.ops.object.mode_set(mode = 'EDIT')
         bpy.ops.mesh.y_vcol_fill(color_option ='WHITE')
         bpy.ops.object.mode_set(mode = 'OBJECT')
+
+    # Wireframe polygon mode uses a temporary uv with every face reset to the unit
+    # square, plus one storing the face world size so the polygon borders can be
+    # drawn in world units regardless of triangulation
+    if bprops.type == 'WIREFRAME' and not bprops.wireframe_triangulated and is_bl_newer_than(2, 81):
+        for ob in objs:
+
+            # Apply subsurf/multires first so the polygons match the baked geometry
+            if bprops.subsurf_influence or bprops.use_baked_disp:
+                set_active_object(ob)
+                need_to_be_applied_modifiers = []
+                for m in ob.modifiers:
+                    if m.type in {'SUBSURF', 'MULTIRES'} and m.render_levels > 0 and m.show_render:
+
+                        # Apply the levels cycles renders with, since modifier apply uses the viewport levels
+                        m.levels = m.render_levels
+
+                        need_to_be_applied_modifiers.append(m)
+
+                    # Also apply displace
+                    if m.type == 'DISPLACE' and m.show_render:
+                        need_to_be_applied_modifiers.append(m)
+
+                # Apply shape keys and modifiers
+                if any(need_to_be_applied_modifiers):
+                    if ob.data.shape_keys:
+                        if is_bl_newer_than(3, 3):
+                            bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+                        else: bpy.ops.object.shape_key_remove(all=True)
+
+                    for m in need_to_be_applied_modifiers:
+                        bpy.ops.object.modifier_apply(modifier=m.name)
+
+            temp_uv = ob.data.uv_layers.new(name=TEMP_WIRE_UV)
+            scale_uv = ob.data.uv_layers.new(name=TEMP_WIRE_SCALE_UV)
+            if not temp_uv or not scale_uv: continue
+            fill_wireframe_uvs(ob, temp_uv, scale_uv)
 
     # Get color alpha channel pair
     root_color_ch, root_alpha_ch = get_color_alpha_ch_pairs(yp)
@@ -3350,6 +3441,12 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
     geometry = None
     vector_math = None
     vector_math_1 = None
+    vector_math_2 = None
+    uv_scale = None
+    separate_xyz = None
+    wire_min = None
+    wire_border = None
+    wire_extras = []
     if bprops.type == 'BEVEL_NORMAL':
         bsdf = mat.node_tree.nodes.new('ShaderNodeBsdfDiffuse')
     elif bprops.type == 'BEVEL_MASK':
@@ -3413,6 +3510,110 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
 
         mat.node_tree.links.new(src.outputs['AO'], invert.inputs[1])
         mat.node_tree.links.new(invert.outputs[0], bsdf.inputs[0])
+        mat.node_tree.links.new(bsdf.outputs[0], output.inputs[0])
+
+    elif bprops.type == 'WIREFRAME':
+        # Polygon mode draws the border distance on the temporary reset uv,
+        # scaled by the face world size so the width is in world units
+        if not bprops.wireframe_triangulated and is_bl_newer_than(2, 81):
+            src = mat.node_tree.nodes.new('ShaderNodeUVMap')
+            src.uv_map = TEMP_WIRE_UV
+
+            uv_scale = mat.node_tree.nodes.new('ShaderNodeUVMap')
+            uv_scale.uv_map = TEMP_WIRE_SCALE_UV
+
+            vector_math = mat.node_tree.nodes.new('ShaderNodeVectorMath')
+            vector_math.operation = 'SUBTRACT'
+            vector_math.inputs[0].default_value = (1.0, 1.0, 1.0)
+
+            vector_math_1 = mat.node_tree.nodes.new('ShaderNodeVectorMath')
+            vector_math_1.operation = 'MINIMUM'
+
+            vector_math_2 = mat.node_tree.nodes.new('ShaderNodeVectorMath')
+            vector_math_2.operation = 'MULTIPLY'
+
+            separate_xyz = mat.node_tree.nodes.new('ShaderNodeSeparateXYZ')
+
+            wire_min = mat.node_tree.nodes.new('ShaderNodeMath')
+            wire_min.operation = 'MINIMUM'
+
+            wire_border = mat.node_tree.nodes.new('ShaderNodeMath')
+            wire_border.operation = 'LESS_THAN'
+            # The wireframe node's size is the distance from the edge, so match it
+            wire_border.inputs[1].default_value = bprops.wireframe_size
+
+            # A negated height marks triangles: restore it for the border
+            # scale and use the sign to also draw their third edge, which
+            # lies on the uv diagonal, as |u - v| * w * h / sqrt(w^2 + h^2)
+            def wire_node(node_type, operation=None):
+                nd = mat.node_tree.nodes.new(node_type)
+                if operation: nd.operation = operation
+                wire_extras.append(nd)
+                return nd
+
+            sep_scale = wire_node('ShaderNodeSeparateXYZ')
+            h_abs = wire_node('ShaderNodeMath', 'ABSOLUTE')
+            comb_scale = wire_node('ShaderNodeCombineXYZ')
+            sep_uv = wire_node('ShaderNodeSeparateXYZ')
+            d_sub = wire_node('ShaderNodeMath', 'SUBTRACT')
+            d_abs = wire_node('ShaderNodeMath', 'ABSOLUTE')
+            w_sq = wire_node('ShaderNodeMath', 'MULTIPLY')
+            h_sq = wire_node('ShaderNodeMath', 'MULTIPLY')
+            sq_sum = wire_node('ShaderNodeMath', 'ADD')
+            hyp = wire_node('ShaderNodeMath', 'SQRT')
+            w_h = wire_node('ShaderNodeMath', 'MULTIPLY')
+            d_scale = wire_node('ShaderNodeMath', 'DIVIDE')
+            d_dist = wire_node('ShaderNodeMath', 'MULTIPLY')
+            is_quad = wire_node('ShaderNodeMath', 'GREATER_THAN')
+            is_quad.inputs[1].default_value = 0.0
+            quad_off = wire_node('ShaderNodeMath', 'MULTIPLY')
+            quad_off.inputs[1].default_value = 100000.0
+            d_gated = wire_node('ShaderNodeMath', 'ADD')
+            wire_min_1 = wire_node('ShaderNodeMath', 'MINIMUM')
+
+            mat.node_tree.links.new(src.outputs[0], vector_math.inputs[1])
+            mat.node_tree.links.new(src.outputs[0], vector_math_1.inputs[0])
+            mat.node_tree.links.new(vector_math.outputs[0], vector_math_1.inputs[1])
+            mat.node_tree.links.new(vector_math_1.outputs[0], vector_math_2.inputs[0])
+            mat.node_tree.links.new(uv_scale.outputs[0], sep_scale.inputs[0])
+            mat.node_tree.links.new(sep_scale.outputs['Y'], h_abs.inputs[0])
+            mat.node_tree.links.new(sep_scale.outputs['X'], comb_scale.inputs[0])
+            mat.node_tree.links.new(h_abs.outputs[0], comb_scale.inputs[1])
+            mat.node_tree.links.new(comb_scale.outputs[0], vector_math_2.inputs[1])
+            mat.node_tree.links.new(vector_math_2.outputs[0], separate_xyz.inputs[0])
+            mat.node_tree.links.new(separate_xyz.outputs['X'], wire_min.inputs[0])
+            mat.node_tree.links.new(separate_xyz.outputs['Y'], wire_min.inputs[1])
+            mat.node_tree.links.new(src.outputs[0], sep_uv.inputs[0])
+            mat.node_tree.links.new(sep_uv.outputs['X'], d_sub.inputs[0])
+            mat.node_tree.links.new(sep_uv.outputs['Y'], d_sub.inputs[1])
+            mat.node_tree.links.new(d_sub.outputs[0], d_abs.inputs[0])
+            mat.node_tree.links.new(sep_scale.outputs['X'], w_sq.inputs[0])
+            mat.node_tree.links.new(sep_scale.outputs['X'], w_sq.inputs[1])
+            mat.node_tree.links.new(h_abs.outputs[0], h_sq.inputs[0])
+            mat.node_tree.links.new(h_abs.outputs[0], h_sq.inputs[1])
+            mat.node_tree.links.new(w_sq.outputs[0], sq_sum.inputs[0])
+            mat.node_tree.links.new(h_sq.outputs[0], sq_sum.inputs[1])
+            mat.node_tree.links.new(sq_sum.outputs[0], hyp.inputs[0])
+            mat.node_tree.links.new(sep_scale.outputs['X'], w_h.inputs[0])
+            mat.node_tree.links.new(h_abs.outputs[0], w_h.inputs[1])
+            mat.node_tree.links.new(w_h.outputs[0], d_scale.inputs[0])
+            mat.node_tree.links.new(hyp.outputs[0], d_scale.inputs[1])
+            mat.node_tree.links.new(d_abs.outputs[0], d_dist.inputs[0])
+            mat.node_tree.links.new(d_scale.outputs[0], d_dist.inputs[1])
+            mat.node_tree.links.new(sep_scale.outputs['Y'], is_quad.inputs[0])
+            mat.node_tree.links.new(is_quad.outputs[0], quad_off.inputs[0])
+            mat.node_tree.links.new(d_dist.outputs[0], d_gated.inputs[0])
+            mat.node_tree.links.new(quad_off.outputs[0], d_gated.inputs[1])
+            mat.node_tree.links.new(wire_min.outputs[0], wire_min_1.inputs[0])
+            mat.node_tree.links.new(d_gated.outputs[0], wire_min_1.inputs[1])
+            mat.node_tree.links.new(wire_min_1.outputs[0], wire_border.inputs[0])
+            mat.node_tree.links.new(wire_border.outputs[0], bsdf.inputs[0])
+        else:
+            src = mat.node_tree.nodes.new('ShaderNodeWireframe')
+            src.inputs[0].default_value = bprops.wireframe_size
+
+            mat.node_tree.links.new(src.outputs[0], bsdf.inputs[0])
+
         mat.node_tree.links.new(bsdf.outputs[0], output.inputs[0])
 
     elif bprops.type == 'POINTINESS':
@@ -3678,7 +3879,7 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
             color = [0.5, 0.5, 1.0, 1.0] 
         elif bprops.type == 'FLOW':
             color = [0.5, 0.5, 0.0, 1.0]
-        elif bprops.type == 'BEVEL_MASK':
+        elif bprops.type in {'WIREFRAME', 'BEVEL_MASK'}:
             color = [0.0, 0.0, 0.0, 1.0]
         else:
             color = [0.5, 0.5, 0.5, 1.0]
@@ -4195,6 +4396,12 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
     if invert: simple_remove_node(mat.node_tree, invert)
     if vector_math: simple_remove_node(mat.node_tree, vector_math)
     if vector_math_1: simple_remove_node(mat.node_tree, vector_math_1)
+    if vector_math_2: simple_remove_node(mat.node_tree, vector_math_2)
+    if uv_scale: simple_remove_node(mat.node_tree, uv_scale)
+    if separate_xyz: simple_remove_node(mat.node_tree, separate_xyz)
+    if wire_min: simple_remove_node(mat.node_tree, wire_min)
+    if wire_border: simple_remove_node(mat.node_tree, wire_border)
+    for wn in wire_extras: simple_remove_node(mat.node_tree, wn)
 
     # Recover original bsdf
     mat.node_tree.links.new(ori_bsdf, output.inputs[0])
@@ -4239,6 +4446,12 @@ def bake_to_entity(bprops, overwrite_img=None, segment=None):
         if vcols:
             vcol = vcols.get(TEMP_VCOL)
             if vcol: vcols.remove(vcol)
+
+        # Delete temp wireframe uvs
+        temp_uv = ob.data.uv_layers.get(TEMP_WIRE_UV)
+        if temp_uv: ob.data.uv_layers.remove(temp_uv)
+        temp_uv = ob.data.uv_layers.get(TEMP_WIRE_SCALE_UV)
+        if temp_uv: ob.data.uv_layers.remove(temp_uv)
 
     # Recover flip normals setup
     if need_flip_normals:
